@@ -4,6 +4,10 @@ import dask.array as dsa
 import matplotlib.pyplot as plt
 from fastjmd95 import jmd95numba
 from intake import open_catalog
+import logging
+
+#ignore Runtimewarning
+np.seterr(divide='ignore', invalid='ignore')
 
 #create a cluster
 from dask_gateway import Gateway
@@ -15,12 +19,17 @@ from dask.distributed import Client
 #client = Client(cluster)
 #client
 
-gateway = Gateway()
-options = gateway.cluster_options()
-options.worker_memory=20
-cluster = gateway.new_cluster(options)
-cluster.adapt(minimum=1,maximum=30)
-client = Client(cluster)
+#gateway = Gateway()
+#options = gateway.cluster_options()
+#options.worker_memory=20
+#cluster = gateway.new_cluster(options)
+#cluster.adapt(minimum=1,maximum=30)
+#client = Client(cluster)
+
+#use logger to show progress
+logging.basicConfig(level=logging.INFO)
+
+logging.info('loading in data')
 
 #call the data
 url = "https://raw.githubusercontent.com/pangeo-data/pangeo-datastore/master/intake-catalogs/ocean/CESM_POP.yaml"
@@ -30,6 +39,7 @@ ds  = cat["CESM_POP_hires_control"].to_dask()
 #select timestamp
 t = 0
 
+logging.info("starting Paige's code")
 #from Paige's code: The biharmonic horiz diffusion routine
 #https://github.com/ocean-transport/cesm-air-sea/blob/master/biharmonic_tendency.ipynb
 
@@ -48,6 +58,7 @@ dtw = np.roll(work1,-1,axis=1)*tarea_r # coeff of west point in 5-point stencil
 
 kmt = ds['KMT'].values # KMT: k-index of deepest grid cell on T grid (where k is the depth level)
 
+logging.info('setting bc')
 # boundary conditions
 kmt_ = kmt > 1 # k=1 is the surface, so this sets all subsurface levels to True
 kmtn = np.roll(kmt_,-1,axis=0)
@@ -69,6 +80,7 @@ j_eq.shape
 ahf = (tarea / ds['UAREA'].values[j_eq, 0])**1.5 # UAREA: area of U cells (cm**2)
 ahf[kmt <= 1] = 0.
 
+logging.info('laplacian operator define')
 def laplacian(T, cn, cs, ce, cw):
     cc = -(cn + cs + ce + cw) # cn,cs,ce,cw are coeffs for laplacian
     return (
@@ -79,32 +91,37 @@ def laplacian(T, cn, cs, ce, cw):
         cw * np.roll(T, 1, axis=-1)          
     )
 
+logging.info('biharmonic operator defined')
 def biharmonic_tendency(T, ahf, cn, cs, ce, cw):
     ah=-3e17 # horizontal tracer mixing coefficient 
     d2tk = ahf * laplacian(T, cn, cs, ce, cw) # take laplacian of T, multiplying by grid factor due to equator
     return ah * laplacian(d2tk, cn, cs, ce, cw) # take laplacian of laplacian of T
 
-futures = client.scatter([ahf, cn, cs, ce, cw], broadcast=True) # this sends all these coeffs to all workers in distributed memory
+#logging.info('futures defined')
+#futures = client.scatter([ahf, cn, cs, ce, cw], broadcast=True) # this sends all these coeffs to all workers in distributed memory
 #END OF PAIGE'S CODE
 
+logging.info('creating t/s tendecies')
 #create temp/salt tendency from mixing [M(temp), M(S) in EOS eqs section]
-SST_bih = xr.DataArray(dsa.map_blocks(biharmonic_tendency, ds.SST.data, *futures, 
+SST_bih = xr.DataArray(dsa.map_blocks(biharmonic_tendency, ds.SST.data, ahf, cn, cs, ce, cw, 
                                       dtype=ds.SST.data.dtype),
                        dims=ds.SST.dims,
                        coords=ds.SST.reset_coords(drop=True).coords)
-SSS_bih = xr.DataArray(dsa.map_blocks(biharmonic_tendency, ds.SSS.data, *futures, 
+SSS_bih = xr.DataArray(dsa.map_blocks(biharmonic_tendency, ds.SSS.data, ahf, cn, cs, ce, cw, 
                                       dtype=ds.SSS.data.dtype),
                        dims=ds.SSS.dims,
                        coords=ds.SSS.reset_coords(drop=True).coords)
 
+logging.info('convert to density tendency')
 #convert to density tendency [alpha*M(temp) + beta*M(S)]
 
 #for a single timestep to save computation cost
 sst = ds.SST.isel(time=t)
 sss = ds.SSS.isel(time=t)
 
-runit2mass = 1.035e3 #rho_0
+#runit2mass = 1.035e3 #rho_0
 
+logging.info('define drhods, drhodt')
 drhodt = xr.apply_ufunc(jmd95numba.drhodt, sss, sst, 0,
                         output_dtypes=[sst.dtype],
                         dask='parallelized').reset_coords(drop=True)#.load()
@@ -112,38 +129,44 @@ drhods = xr.apply_ufunc(jmd95numba.drhods, sss, sst, 0,
                         output_dtypes=[sss.dtype],
                         dask='parallelized').reset_coords(drop=True)#.load()
 
-alpha = - drhodt / runit2mass
-beta = drhods / runit2mass
+#alpha = - drhodt / runit2mass
+#beta = drhods / runit2mass
 
-dens_tend = alpha * SST_bih.isel(time=t) + beta * SSS_bih.isel(time=t)
+dens_tend = drhodt * SST_bih.isel(time=t) + drhods * SSS_bih.isel(time=t)
 dens_tend
 
+logging.info('calculate M(rho)')
 #calculate M(rho)
 rho = xr.apply_ufunc(jmd95numba.rho, ds.SSS, ds.SST, 0,
                         output_dtypes=[ds.SST.dtype],
                         dask='parallelized').reset_coords(drop=True)#.load()
-rho_bih = xr.DataArray(dsa.map_blocks(biharmonic_tendency, rho.data, *futures, 
+rho_bih = xr.DataArray(dsa.map_blocks(biharmonic_tendency, rho.data, ahf, cn, cs, ce, cw, 
                                       dtype=rho.data.dtype),
                        dims=rho.dims,
                        coords=rho.reset_coords(drop=True).coords)
 
+logging.info('calculate cabbeling term')
 #determine cabbeling as C = alpha*M(temp) + beta*M(S) - M(rho)
 cabbeling = dens_tend - rho_bih
 
+logging.info('plotting all four terms')
 #plot all four terms
+selection = dict(time=0, nlat=slice(1500,1600), nlon=slice(500,600))
+kwargs = {'shrink': 0.8, 'label':r'[$\frac{kg}{m^3 s}$]'}
+
 fig, ax = plt.subplots(2,2, figsize=(15,10))
 
-(SST_bih/1e-8).isel(time=t).plot(robust=True, ax=ax[0,0], 
-                                 cbar_kwargs={'shrink': 0.8, 'label':r'[$\frac{kg}{m^3 s}$]'})
+(SST_bih*drhodt).isel(**selection).plot(robust=True, ax=ax[0,0], 
+                                 cbar_kwargs=kwargs)
 ax[0,0].set_title('SST mixing tendency')
-(SSS_bih/1e-8).isel(time=t).plot(robust=True, ax=ax[0,1], 
-                                 cbar_kwargs={'shrink': 0.8, 'label':r'[$\frac{kg}{m^3 s}$]'})
+(SSS_bih*drhods).isel(**selection).plot(robust=True, ax=ax[0,1], 
+                                 cbar_kwargs=kwargs)
 ax[0,1].set_title('SSS mixing tendency')
-(rho_bih/1e-8).isel(time=t).plot(robust=True, ax=ax[1,0], 
-                                 cbar_kwargs={'shrink': 0.8, 'label':r'[$\frac{kg}{m^3 s}$]'})
+(rho_bih).isel(**selection).plot(robust=True, ax=ax[1,0], 
+                                 cbar_kwargs=kwargs)
 ax[1,0].set_title(r'$\rho$ mixing tendency')
-(cabbeling/1e-8).isel(time=t).plot(robust=True, ax=ax[1,1], 
-                                   cbar_kwargs={'shrink': 0.8, 'label':r'[$\frac{kg}{m^3 s}$]'})
+(cabbeling).isel(**selection).plot(robust=True, ax=ax[1,1], 
+                                   cbar_kwargs=kwargs)
 ax[1,1].set_title('Cabbeling tendency')
 
 plt.tight_layout();
