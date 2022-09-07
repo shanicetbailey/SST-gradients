@@ -9,6 +9,7 @@ import logging
 # (Compute the gradient https://pop-tools.readthedocs.io/en/latest/examples/pop_div_curl_xr_xgcm_metrics_compare.html#gradient)
 
 #ignore Runtimewarning
+np.warnings.filterwarnings('ignore')
 np.seterr(divide='ignore', invalid='ignore')
 
 #create a cluster
@@ -44,7 +45,6 @@ t = 0
 logging.info("starting Paige's code")
 #from Paige's code: The biharmonic horiz diffusion routine
 #https://github.com/ocean-transport/cesm-air-sea/blob/master/biharmonic_tendency.ipynb
-
 # raw grid geometry
 work1 = (ds['HTN'].values / # HTN: cell widths on North sides of T cell (cm)
          ds['HUW'].values) # HUW: cell widths on West sides of U cell (cm)
@@ -113,63 +113,8 @@ SSS_bih = xr.DataArray(dsa.map_blocks(biharmonic_tendency, ds.SSS.data, ahf, cn,
                                       dtype=ds.SSS.data.dtype),
                        dims=ds.SSS.dims,
                        coords=ds.SSS.reset_coords(drop=True).coords)
+print('THIS IS SSS_BIH', SSS_bih)
 
-logging.info('convert to density tendency')
-#convert to density tendency [alpha*M(temp) + beta*M(S)]
-
-#for a single timestep to save computation cost
-sst = ds.SST.isel(time=t)
-sss = ds.SSS.isel(time=t)
-
-#runit2mass = 1.035e3 #rho_0
-
-logging.info('define drhods, drhodt')
-drhodt = xr.apply_ufunc(jmd95numba.drhodt, sss, sst, 0,
-                        output_dtypes=[sst.dtype],
-                        dask='parallelized').reset_coords(drop=True)#.load()
-drhods = xr.apply_ufunc(jmd95numba.drhods, sss, sst, 0,
-                        output_dtypes=[sss.dtype],
-                        dask='parallelized').reset_coords(drop=True)#.load()
-
-#alpha = - drhodt / runit2mass
-#beta = drhods / runit2mass
-
-dens_tend = drhodt * SST_bih.isel(time=t) + drhods * SSS_bih.isel(time=t)
-dens_tend
-
-logging.info('calculate M(rho)')
-#calculate M(rho)
-rho = xr.apply_ufunc(jmd95numba.rho, ds.SSS, ds.SST, 0,
-                        output_dtypes=[ds.SST.dtype],
-                        dask='parallelized').reset_coords(drop=True)#.load()
-rho_bih = xr.DataArray(dsa.map_blocks(biharmonic_tendency, rho.data, ahf, cn, cs, ce, cw, 
-                                      dtype=rho.data.dtype),
-                       dims=rho.dims,
-                       coords=rho.reset_coords(drop=True).coords)
-
-logging.info('calculate cabbeling term')
-#determine cabbeling as C = alpha*M(temp) + beta*M(S) - M(rho)
-cabbeling = dens_tend - rho_bih
-
-logging.info('plotting all four terms')
-#plot all four terms
-selection = dict(time=0, nlat=slice(1500,1600), nlon=slice(500,600))
-kwargs = {'shrink': 0.8, 'label':r'[$\frac{kg}{m^3 s}$]'}
-
-fig, ax = plt.subplots(2,2, figsize=(15,10))
-
-(SST_bih*drhodt).isel(**selection).plot(robust=True, ax=ax[0,0], 
-                                 cbar_kwargs=kwargs)
-ax[0,0].set_title('SST mixing tendency')
-(SSS_bih*drhods).isel(**selection).plot(robust=True, ax=ax[0,1], 
-                                 cbar_kwargs=kwargs)
-ax[0,1].set_title('SSS mixing tendency')
-(rho_bih).isel(**selection).plot(robust=True, ax=ax[1,0], 
-                                 cbar_kwargs=kwargs)
-ax[1,0].set_title(r'$\rho$ mixing tendency')
-(cabbeling).isel(**selection).plot(robust=True, ax=ax[1,1], 
-                                   cbar_kwargs=kwargs)
-ax[1,1].set_title('Cabbeling tendency')
-
-plt.tight_layout()
-plt.savefig('tendency_terms.png');
+logging.info('plotting sst bih')
+SST_bih[0].plot(robust=True)
+plt.savefig("sst.png")
